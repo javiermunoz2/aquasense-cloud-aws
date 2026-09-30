@@ -1,0 +1,14 @@
+# Credentials / key pairs — never commit
+*.ppk
+*.pem
+*.key
+.env
+.aws/
+
+# Python
+__pycache__/
+.venv/
+*.pyc
+
+# Lambda packaging
+*.zip

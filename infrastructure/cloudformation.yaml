@@ -1,0 +1,307 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Proyecto AquaSenseCloud - Infraestructura Base + Servicio Web persistente (2 EC2 fijas)"
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: "proy-icap-keypair"
+    Description: Par de claves EC2 existente
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: AMI mas reciente de Amazon Linux 2 (se resuelve sola, evita AMIs caducadas)
+
+  InstanceProfileName:
+    Type: String
+    Default: "LabInstanceProfile"
+    Description: Perfil de instancia IAM (en AWS Academy es LabInstanceProfile)
+
+Resources:
+
+  ProyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: proy-vpc
+
+  ProyIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: proy-igw
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ProyVPC
+      InternetGatewayId: !Ref ProyIGW
+
+  ProyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProyVPC
+      Tags:
+        - Key: Name
+          Value: proy-route-table
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref ProyRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ProyIGW
+
+  ProySubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: proy-public-subnet-a
+
+  SubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProySubnetA
+      RouteTableId: !Ref ProyRouteTable
+
+  ProySubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ProyVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: proy-public-subnet-b
+
+  SubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ProySubnetB
+      RouteTableId: !Ref ProyRouteTable
+
+  LBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "SG del balanceador - permite HTTP desde cualquier sitio"
+      VpcId: !Ref ProyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: proy-lb-sg
+
+  EC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "SG de las EC2 - SSH desde fuera y HTTP solo desde el balanceador"
+      VpcId: !Ref ProyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LBSG
+      Tags:
+        - Key: Name
+          Value: proy-ec2-sg
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: proy-launch-template
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        SecurityGroupIds:
+          - !Ref EC2SG
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -xe
+
+            # 1. Dependencias
+            yum update -y
+            yum install -y python3
+            pip3 install flask boto3
+
+            # 2. Crear la aplicacion Flask en disco
+            mkdir -p /opt/proy
+            cat > /opt/proy/app.py << 'PYEOF'
+            from flask import Flask, request, jsonify
+            import boto3
+            from decimal import Decimal
+
+            app = Flask(__name__)
+
+            DYNAMO_TABLE = 'TemperatureData'
+            REGION = 'us-east-1'
+
+            dynamodb = boto3.resource('dynamodb', region_name=REGION)
+            table = dynamodb.Table(DYNAMO_TABLE)
+
+            def decimal_default(obj):
+                if isinstance(obj, Decimal):
+                    return float(obj)
+                raise TypeError
+            app.json.default = decimal_default
+
+            @app.route('/')
+            def root():
+                return jsonify({'status': 'ok'}), 200
+
+            @app.route('/health')
+            def health():
+                return jsonify({'status': 'healthy'}), 200
+
+            def get_data(year, month, attribute):
+                if not year or not month:
+                    return None, "Faltan parametros"
+                key_id = f"{year}/{str(month).zfill(2)}"
+                try:
+                    response = table.get_item(Key={'Fecha': key_id})
+                    item = response.get('Item')
+                    if not item:
+                        return None, "Datos no encontrados"
+                    return item.get(attribute), None
+                except Exception as e:
+                    return None, str(e)
+
+            @app.route('/temp')
+            def get_temp():
+                y, m = request.args.get('year'), request.args.get('month')
+                val, err = get_data(y, m, 'TempMedia')
+                if err:
+                    return jsonify({'error': err}), 404
+                return jsonify({'year': int(y), 'month': int(m), 'temp_media': val})
+
+            @app.route('/maxdiff')
+            def get_maxdiff():
+                y, m = request.args.get('year'), request.args.get('month')
+                val, err = get_data(y, m, 'MaxDiff')
+                if err:
+                    return jsonify({'error': err}), 404
+                return jsonify({'year': int(y), 'month': int(m), 'max_diff': val})
+
+            @app.route('/sd')
+            def get_sd():
+                y, m = request.args.get('year'), request.args.get('month')
+                val, err = get_data(y, m, 'MaxDesviacion')
+                if err:
+                    return jsonify({'error': err}), 404
+                return jsonify({'year': int(y), 'month': int(m), 'max_desviacion': val})
+
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=80)
+            PYEOF
+
+            # 3. Crear el servicio systemd (ESTO arregla la persistencia)
+            cat > /etc/systemd/system/proy-web.service << 'SVCEOF'
+            [Unit]
+            Description=Proy AquaSenseCloud Web Service
+            After=network.target
+
+            [Service]
+            ExecStart=/usr/bin/python3 /opt/proy/app.py
+            WorkingDirectory=/opt/proy
+            Restart=always
+            RestartSec=3
+            User=root
+
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
+
+            # 4. Activar el servicio: arranca ahora Y en cada reinicio
+            systemctl daemon-reload
+            systemctl enable proy-web.service
+            systemctl start proy-web.service
+
+  EC2A:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref ProySubnetA
+      Tags:
+        - Key: Name
+          Value: proy-ec2-a
+
+  EC2B:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref ProySubnetB
+      Tags:
+        - Key: Name
+          Value: proy-ec2-b
+
+  ProyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: proy-target-group
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProyVPC
+      TargetType: instance
+      HealthCheckPath: "/health"
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      Targets:
+        - Id: !Ref EC2A
+        - Id: !Ref EC2B
+
+  ProyLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: proy-lb
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref ProySubnetA
+        - !Ref ProySubnetB
+      SecurityGroups:
+        - !Ref LBSG
+
+  ProyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ProyLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ProyTargetGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS publico del balanceador de carga
+    Value: !GetAtt ProyLoadBalancer.DNSName
